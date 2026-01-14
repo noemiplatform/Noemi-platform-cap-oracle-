@@ -1,0 +1,357 @@
++-----------------------------+
+           |   Your Local Repo           |
+           |   - public/                |
+           |   - functions/             |
+           |   - noemi-cap/             |
+           |   - Noemi_Oracle_Ultimate_Notify.js  |
+           +-------------+---------------+
+                         |
+                         | node Noemi_Oracle_Ultimate_Notify.js deploy
+                         v
+           +-----------------------------+
+           | Script Actions:             |
+           | 1. Generate SEO             |
+           | 2. Generate Legal Files      |
+           | 3. Generate Notarized PDF    |
+           | 4. Create Export ZIP        |
+           | 5. Deploy Firebase Hosting  |
+           |    + Functions              |
+           | 6. Log Release              |
+           | 7. Cleanup Old Versions     |
+           | 8. Send Webhook Notification|
+           +-------------+---------------+
+                         |
+                         v
+          +--------------------------------+
+          | Firebase Hosting (Versioned)   |
+          | release-YYYY-MM-DDTHH-MM-SS   |
+          +--------------------------------+
+                         |
+         +---------------+----------------+
+         |                                |
+         v                                v
+  List Releases                        Rollback
+node ... list                     node ... rollback <version>npm install pdfkit archiver
+firebase tools upgradenode Noemi_Oracle_Ultimate_Notify.js rollback release-2026-01-14T03-30-00node Noemi_Oracle_Ultimate_Notify.js list/**
+ * NOEMI ORACLE ULTIMATE CLEAN + NOTIFY
+ * Single-script deploy for Noemi Platform CAP
+ * Features:
+ * - SEO generation
+ * - Legal + attestation
+ * - Notarized PDF
+ * - Export archive
+ * - Firebase Hosting + Functions deploy
+ * - Versioned releases per timestamp
+ * - Built-in rollback
+ * - List all releases
+ * - Auto-clean old versions
+ * - Automatic deployment notifications via webhook
+ */
+
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
+const archiver = require("archiver");
+const { execSync } = require("child_process");
+const PDFDocument = require("pdfkit");
+const https = require("https");
+
+// ---------------- CONFIG ----------------
+const ROOT = __dirname;
+const PUBLIC = path.join(ROOT,"public");
+const EXPORT_DIR = path.join(ROOT,"EXPORT_PACKAGE");
+const CAP_DIR = path.join(ROOT,"noemi-cap");
+const FUNCTIONS_DIR = path.join(ROOT,"functions");
+const YEAR = new Date().getFullYear();
+const NOW = new Date().toISOString().replace(/[:.]/g,"-");
+const BASE_URL = "https://docs.drpc.org";
+const RELEASES_LOG = path.join(EXPORT_DIR,"releases.json");
+const KEEP_VERSIONS = 5; // Number of latest versions to keep
+const NOTIFY_WEBHOOK = process.env.NOEMI_NOTIFY_WEBHOOK || ""; // optional webhook URL
+
+// ---------------- UTILITIES ----------------
+function write(file, content){ fs.writeFileSync(path.join(ROOT,file),content.trim()+"\n"); }
+function sha256(data){ return crypto.createHash("sha256").update(data).digest("hex"); }
+function fileHash(file){ return sha256(fs.readFileSync(path.join(ROOT,file))); }
+[PUBLIC,EXPORT_DIR].forEach(d=>{ if(!fs.existsSync(d)) fs.mkdirSync(d,{recursive:true}); });
+
+// ---------------- COMMAND LINE ----------------
+const ACTION = process.argv[2] || "deploy";
+const TARGET_VERSION = process.argv[3];
+
+// ---------------- NOTIFICATIONS ----------------
+function notify(message){
+    if(!NOTIFY_WEBHOOK) return;
+    try{
+        const data = JSON.stringify({text: message});
+        const url = new URL(NOTIFY_WEBHOOK);
+        const options = {hostname: url.hostname, path: url.pathname, method: 'POST', headers:{'Content-Type':'application/json','Content-Length':data.length}};
+        const req = https.request(options, res => {});
+        req.on('error', e => console.error('❌ Notification failed:', e));
+        req.write(data);
+        req.end();
+    } catch(e){ console.error('❌ Notification error:', e); }
+}
+
+// ---------------- FUNCTIONS ----------------
+function generateSEO(versionFolder){
+    const ROUTES = [
+      "/", "/ethereum-api/eth_chainId", "/ethereum-api/eth_getBlockByNumber", "/ethereum-api/eth_getLogs",
+      "/gettingstarted/createaccount", "/gettingstarted/firstrequest", "/gettingstarted/jwt", "/gettingstarted/teamsAndRoles",
+      "/gettingstarted/verification", "/howitworks/overview", "/howitworks/ratelimiting",
+      "/pricing/compute-units", "/pricing/requests", "/providers/setup",
+      "/specs/balancing/costmodel", "/specs/balancing/overview", "/specs/balancing/rating",
+      "/specs/balancing/strategies", "/web-api/overview"
+    ];
+    fs.writeFileSync(path.join(PUBLIC,"sitemap.xml"),`<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+${ROUTES.map(r=>`  <url>\n    <loc>${BASE_URL}/${versionFolder}${r}</loc>\n    <lastmod>${NOW}</lastmod>\n  </url>`).join("\n")}
+</urlset>`);
+    fs.writeFileSync(path.join(PUBLIC,"robots.txt"),`User-agent: *
+Allow: /
+Disallow: /__/auth/
+Disallow: /admin/
+Disallow: /private/
+Sitemap: ${BASE_URL}/sitemap.xml`);
+}
+
+function generateLegal(versionFolder){
+    write("LICENSE",`Copyright © ${YEAR}\nAll Rights Reserved.
+No license granted. Unauthorized use, fork, modification, or distribution prohibited.`);
+    write("NOTICE.txt",`Ownership Notice
+This repository and all contents are proprietary.
+Author: Repository Owner
+First Publication: ${YEAR}`);
+    const treeHash = sha256(["LICENSE","NOTICE.txt"].map(f=>fileHash(f)).join("") + fs.readFileSync(path.join(PUBLIC,"sitemap.xml")));
+    const releaseID = sha256(treeHash+NOW).slice(0,32);
+    write("ATTESTATION.txt",`OWNERSHIP ATTESTATION\nRelease ID: ${releaseID}\nTree Hash: ${treeHash}\nTimestamp: ${NOW}`);
+    return {releaseID, treeHash};
+}
+
+function generatePDF(releaseID, treeHash){
+    const pdfPath = path.join(EXPORT_DIR,`NOEMI_ORACLE_${NOW}.pdf`);
+    const doc = new PDFDocument();
+    doc.pipe(fs.createWriteStream(pdfPath));
+    doc.fontSize(20).text("Noemi Oracle Ultimate Notarization",{align:"center"});
+    doc.moveDown();
+    doc.fontSize(12).text(`Release ID: ${releaseID}`);
+    doc.text(`Tree Hash: ${treeHash}`);
+    doc.text(`Timestamp: ${NOW}`);
+    doc.moveDown();
+    doc.text("Included Legal Artifacts:",{underline:true});
+    ["LICENSE","NOTICE.txt"].forEach(f=>doc.text(`- ${f} (SHA256: ${fileHash(f)})`));
+    doc.end();
+    return pdfPath;
+}
+
+function exportPackage(){
+    const archiveName = `Noemi_Oracle_Export_${NOW}.zip`;
+    const output = fs.createWriteStream(path.join(EXPORT_DIR,archiveName));
+    const archive = archiver('zip',{zlib:{level:9}});
+    output.on('close',()=>console.log(`✅ EXPORT COMPLETE: ${archiveName} (${archive.pointer()} bytes)`));
+    archive.pipe(output);
+    archive.directory(ROOT,false, entry=>!["node_modules",".git"].some(s=>entry.name.includes(s)));
+    archive.directory(CAP_DIR, 'noemi-cap');
+    if(fs.existsSync(FUNCTIONS_DIR)) archive.directory(FUNCTIONS_DIR, 'functions');
+    archive.finalize();
+    return archiveName;
+}
+
+function ciCheck(){
+    ["sitemap.xml","robots.txt","LICENSE","NOTICE.txt"].forEach(f=>{
+      if(!fs.existsSync(path.join(ROOT,f))){
+        console.error(`❌ DEPLOY BLOCKED: Missing ${f}`);
+        process.exit(1);
+      }
+    });
+}
+
+function deployFirebase(versionFolder){
+    console.log(`🚀 Deploying Firebase Hosting + Functions for version: ${versionFolder}`);
+    const versionedPublic = path.join(PUBLIC, versionFolder);
+    if(!fs.existsSync(versionedPublic)) fs.mkdirSync(versionedPublic);
+    fs.readdirSync(PUBLIC).forEach(file=>{
+        const src = path.join(PUBLIC,file);
+        const dest = path.join(versionedPublic,file);
+        if(fs.lstatSync(src).isFile()) fs.copyFileSync(src,dest);
+    });
+
+    const fbConfigPath = path.join(ROOT,"firebase.json");
+    const fbConfig = JSON.parse(fs.readFileSync(fbConfigPath,"utf-8"));
+    const originalPublic = fbConfig.hosting.public;
+    fbConfig.hosting.public = path.relative(ROOT, versionedPublic);
+    fs.writeFileSync(fbConfigPath, JSON.stringify(fbConfig,null,2));
+
+    execSync("firebase deploy --only hosting,functions", {stdio:"inherit"});
+
+    fbConfig.hosting.public = originalPublic;
+    fs.writeFileSync(fbConfigPath, JSON.stringify(fbConfig,null,2));
+}
+
+function logRelease(versionFolder, releaseID){
+    let releases = [];
+    if(fs.existsSync(RELEASES_LOG)) releases = JSON.parse(fs.readFileSync(RELEASES_LOG,"utf-8"));
+    releases.push({version: versionFolder, releaseID, timestamp: NOW});
+    fs.writeFileSync(RELEASES_LOG, JSON.stringify(releases,null,2));
+    return releases;
+}
+
+function listReleases(){
+    if(!fs.existsSync(RELEASES_LOG)){ console.log("No releases yet."); return; }
+    const releases = JSON.parse(fs.readFileSync(RELEASES_LOG,"utf-8"));
+    console.log("Available releases:");
+    releases.forEach(r=>console.log(`- ${r.version} | ReleaseID: ${r.releaseID} | Timestamp: ${r.timestamp}`));
+}
+
+function cleanupOldVersions(releases){
+    if(releases.length <= KEEP_VERSIONS) return;
+    const toDelete = releases.slice(0, releases.length - KEEP_VERSIONS);
+    toDelete.forEach(r=>{
+        const folder = path.join(PUBLIC, r.version);
+        if(fs.existsSync(folder)) fs.rmSync(folder,{recursive:true,force:true});
+        console.log(`🧹 Removed old version folder: ${r.version}`);
+    });
+    releases = releases.slice(-KEEP_VERSIONS);
+    fs.writeFileSync(RELEASES_LOG, JSON.stringify(releases,null,2));
+}
+
+// ---------------- MAIN ----------------
+if(ACTION === "deploy"){
+    const VERSION_FOLDER = `release-${NOW}`;
+    console.log("🔹 Starting Versioned Deployment...");
+    generateSEO(VERSION_FOLDER);
+    const {releaseID, treeHash} = generateLegal(VERSION_FOLDER);
+    const pdfPath = generatePDF(releaseID, treeHash);
+    const archiveName = exportPackage();
+    ciCheck();
+    deployFirebase(VERSION_FOLDER);
+    let releases = logRelease(VERSION_FOLDER, releaseID);
+    cleanupOldVersions(releases);
+    console.log("🔐 NOEMI ORACLE ULTIMATE CLEAN DEPLOY COMPLETE");
+    notify(`🚀 New Noemi Oracle Deployment: ${VERSION_FOLDER} | Release ID: ${releaseID}`);
+}
+else if(ACTION === "rollback"){
+    if(!TARGET_VERSION){
+        console.error("❌ Specify version folder: node Noemi_Oracle_Ultimate_Notify.js rollback release-YYYY-MM-DDTHH-MM-SS");
+        process.exit(1);
+    }
+    console.log(`🔄 Rolling back Firebase Hosting to version: ${TARGET_VERSION}`);
+    deployFirebase(TARGET_VERSION);
+    console.log(`✅ ROLLBACK COMPLETE to ${TARGET_VERSION}`);
+    notify(`🔄 Noemi Oracle Rollback: ${TARGET_VERSION}`);
+}
+else if(ACTION === "list"){
+    listReleases();
+}
+else{
+    console.error("❌ Unknown action. Use: deploy | rollback <version> | list");
+}https://docs.drpc.org/sitemap.xmlfirebase deploy{
+  "hosting": {
+    "public": "public",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ]
+  }
+}{
+  "scripts": {
+    "predeploy": "node scripts/generate-seo.js"
+  }
+}/**
+ * Google-acceptable SEO generator
+ * - sitemap.xml
+ * - robots.txt
+ * Firebase Hosting compatible
+ * 100% owner controlled
+ */
+
+const fs = require("fs");
+const path = require("path");
+
+const BASE_URL = "https://docs.drpc.org";
+const OUTPUT_DIR = path.join(__dirname, "..", "public");
+
+const urls = [
+  "/",
+  "/ethereum-api/eth_chainId",
+  "/ethereum-api/eth_getBlockByNumber",
+  "/ethereum-api/eth_getLogs",
+  "/gettingstarted/createaccount",
+  "/gettingstarted/firstrequest",
+  "/gettingstarted/jwt",
+  "/gettingstarted/teamsAndRoles",
+  "/gettingstarted/verification",
+  "/howitworks/overview",
+  "/howitworks/ratelimiting",
+  "/pricing/compute-units",
+  "/pricing/requests",
+  "/providers/setup",
+  "/specs/balancing/costmodel",
+  "/specs/balancing/overview",
+  "/specs/balancing/rating",
+  "/specs/balancing/strategies",
+  "/web-api/overview"
+];
+
+if (!fs.existsSync(OUTPUT_DIR)) {
+  fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+}
+
+const now = new Date().toISOString();
+
+/* ---------- SITEMAP ---------- */
+const sitemap = `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+${urls
+  .map(
+    (u) => `  <url>
+    <loc>${BASE_URL}${u}</loc>
+    <lastmod>${now}</lastmod>
+  </url>`
+  )
+  .join("\n")}
+</urlset>`;
+
+fs.writeFileSync(path.join(OUTPUT_DIR, "sitemap.xml"), sitemap.trim());
+
+/* ---------- ROBOTS ---------- */
+const robots = `User-agent: *
+Allow: /
+
+Sitemap: ${BASE_URL}/sitemap.xml
+`;
+
+fs.writeFileSync(path.join(OUTPUT_DIR, "robots.txt"), robots.trim());
+
+console.log("✅ sitemap.xml and robots.txt generated (Google compliant)");/
+├── public/
+│   ├── sitemap.xml        ← auto-generated
+│   ├── robots.txt         ← auto-generated
+│
+├── scripts/
+│   └── generate-seo.js    ← ONE script (this is it)
+│
+├── firebase.json
+├── package.json<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:news="http://www.google.com/schemas/sitemap-news/0.9" xmlns:xhtml="http://www.w3.org/1999/xhtml" xmlns:mobile="http://www.google.com/schemas/sitemap-mobile/1.0" xmlns:image="http://www.google.com/schemas/sitemap-image/1.1" xmlns:video="http://www.google.com/schemas/sitemap-video/1.1">
+<url><loc>https://docs.drpc.org</loc><lastmod>2024-05-22T09:31:24.482Z</lastmod><changefreq>weekly</changefreq><priority>0.5</priority></url>
+<url><loc>https://docs.drpc.org/ethereum-api/eth_chainId</loc><lastmod>2024-05-22T09:31:24.482Z</lastmod><changefreq>weekly</changefreq><priority>0.5</priority></url>
+<url><loc>https://docs.drpc.org/ethereum-api/eth_getBlockByNumber</loc><lastmod>2024-05-22T09:31:24.482Z</lastmod><changefreq>weekly</changefreq><priority>0.5</priority></url>
+<url><loc>https://docs.drpc.org/ethereum-api/eth_getLogs</loc><lastmod>2024-05-22T09:31:24.482Z</lastmod><changefreq>weekly</changefreq><priority>0.5</priority></url>
+<url><loc>https://docs.drpc.org/gettingstarted/createaccount</loc><lastmod>2024-05-22T09:31:24.482Z</lastmod><changefreq>weekly</changefreq><priority>0.5</priority></url>
+<url><loc>https://docs.drpc.org/gettingstarted/firstrequest</loc><lastmod>2024-05-22T09:31:24.482Z</lastmod><changefreq>weekly</changefreq><priority>0.5</priority></url>
+<url><loc>https://docs.drpc.org/gettingstarted/jwt</loc><lastmod>2024-05-22T09:31:24.482Z</lastmod><changefreq>weekly</changefreq><priority>0.5</priority></url>
+<url><loc>https://docs.drpc.org/gettingstarted/teamsAndRoles</loc><lastmod>2024-05-22T09:31:24.482Z</lastmod><changefreq>weekly</changefreq><priority>0.5</priority></url>
+<url><loc>https://docs.drpc.org/gettingstarted/verification</loc><lastmod>2024-05-22T09:31:24.482Z</lastmod><changefreq>weekly</changefreq><priority>0.5</priority></url>
+<url><loc>https://docs.drpc.org/howitworks/overview</loc><lastmod>2024-05-22T09:31:24.483Z</lastmod><changefreq>weekly</changefreq><priority>0.5</priority></url>
+<url><loc>https://docs.drpc.org/howitworks/ratelimiting</loc><lastmod>2024-05-22T09:31:24.483Z</lastmod><changefreq>weekly</changefreq><priority>0.5</priority></url>
+<url><loc>https://docs.drpc.org/pricing/compute-units</loc><lastmod>2024-05-22T09:31:24.483Z</lastmod><changefreq>weekly</changefreq><priority>0.5</priority></url>
+<url><loc>https://docs.drpc.org/pricing/requests</loc><lastmod>2024-05-22T09:31:24.483Z</lastmod><changefreq>weekly</changefreq><priority>0.5</priority></url>
+<url><loc>https://docs.drpc.org/providers/setup</loc><lastmod>2024-05-22T09:31:24.483Z</lastmod><changefreq>weekly</changefreq><priority>0.5</priority></url>
+<url><loc>https://docs.drpc.org/specs/balancing/costmodel</loc><lastmod>2024-05-22T09:31:24.483Z</lastmod><changefreq>weekly</changefreq><priority>0.5</priority></url>
+<url><loc>https://docs.drpc.org/specs/balancing/overview</loc><lastmod>2024-05-22T09:31:24.483Z</lastmod><changefreq>weekly</changefreq><priority>0.5</priority></url>
+<url><loc>https://docs.drpc.org/specs/balancing/rating</loc><lastmod>2024-05-22T09:31:24.483Z</lastmod><changefreq>weekly</changefreq><priority>0.5</priority></url>
+<url><loc>https://docs.drpc.org/specs/balancing/strategies</loc><lastmod>2024-05-22T09:31:24.483Z</lastmod><changefreq>weekly</changefreq><priority>0.5</priority></url>
+<url><loc>https://docs.drpc.org/web-api/overview</loc><lastmod>2024-05-22T09:31:24.483Z</lastmod><changefreq>weekly</changefreq><priority>0.5</priority></url>
+</urlset>
